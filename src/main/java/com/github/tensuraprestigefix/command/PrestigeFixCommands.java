@@ -117,7 +117,7 @@ public final class PrestigeFixCommands {
             return 0;
         }
         int before = TrNightmareCommandBridge.getSlots(target);
-        UltimateSlotPrestigeHandler.onPlayerLoggedIn(target);
+        UltimateSlotPrestigeHandler.reconcileAndRecoverSlots(target, true);
         int after = TrNightmareCommandBridge.getSlots(target);
         source.sendSuccess(() -> Component.literal("Checked/recovered Prestige Ultimate Skill Slots for " + target.getGameProfile().getName() + ": " + before + " -> " + after + " slots.")
                 .withStyle(ChatFormatting.GREEN), true);

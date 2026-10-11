@@ -56,7 +56,7 @@ public class TensuraPrestigeFix {
         event.enqueueWork(() -> {
             if (ModList.get().isLoaded(STEXTRAS_MOD_ID)) {
                 StExtrasEventBridge.registerEvents();
-                LOGGER.info("[TensuraPrestigeFix] Hooked SlimeThroneExtras STPlayerEvents.PRESTIGE & PRESTIGE_LEVEL listeners.");
+                LOGGER.info("[TensuraPrestigeFix] Hooked SlimeThroneExtras STPlayerEvents.PRESTIGE listener.");
             } else {
                 LOGGER.info("[TensuraPrestigeFix] SlimeThroneExtras not detected; relying on ResetScrollItem Prestige detection.");
             }
@@ -93,10 +93,12 @@ public class TensuraPrestigeFix {
 
             STPlayerEvents.PRESTIGE_LEVEL.register((player, level) -> {
                 if (player != null && !player.level().isClientSide()) {
-                    LOGGER.info("[TensuraPrestigeFix] Detected STPlayerEvents.PRESTIGE_LEVEL (level={}) for player {} ({}).",
+                    // Note: SlimeThroneExtras fires PRESTIGE_LEVEL on EVERY ResetScrollItem.resetEverything call
+                    // (including non-prestige resets at level=0 and race selection in the Reincarnation GUI).
+                    // Do NOT treat PRESTIGE_LEVEL as a Prestige trigger; only enforce already-preserved slot state.
+                    LOGGER.debug("[TensuraPrestigeFix] Observed STPlayerEvents.PRESTIGE_LEVEL (level={}) for player {} ({}).",
                             level, player.getGameProfile().getName(), player.getUUID());
-                    UltimateSlotPrestigeHandler.onPrestigeConfirmed(player);
-                    FtbQuestsPrestigeResetHandler.onPlayerPrestige(player);
+                    UltimateSlotPrestigeHandler.onPostResetSync(player);
                 }
             });
         }

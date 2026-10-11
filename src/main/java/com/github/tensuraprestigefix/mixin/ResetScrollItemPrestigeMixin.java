@@ -22,7 +22,14 @@ public abstract class ResetScrollItemPrestigeMixin {
     @Inject(method = "releaseUsing", at = @At("HEAD"), remap = false)
     private void tensuraPrestigeFix$beforeReleaseUsing(ItemStack stack, Level level, LivingEntity entity, int timeLeft, CallbackInfo ci) {
         if (!level.isClientSide() && entity instanceof ServerPlayer serverPlayer) {
-            UltimateSlotPrestigeHandler.captureSnapshotBeforeReset(serverPlayer, false);
+            UltimateSlotPrestigeHandler.onBeginReleaseUsing(serverPlayer);
+        }
+    }
+
+    @Inject(method = "releaseUsing", at = @At("RETURN"), remap = false)
+    private void tensuraPrestigeFix$afterReleaseUsing(ItemStack stack, Level level, LivingEntity entity, int timeLeft, CallbackInfo ci) {
+        if (!level.isClientSide() && entity instanceof ServerPlayer serverPlayer) {
+            UltimateSlotPrestigeHandler.onEndReleaseUsing(serverPlayer);
         }
     }
 

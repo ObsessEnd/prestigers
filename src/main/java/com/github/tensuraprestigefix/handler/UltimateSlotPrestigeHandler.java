@@ -48,13 +48,42 @@ public final class UltimateSlotPrestigeHandler {
     public static final String TAG_RESET_PROGRESS = "trnightmare:ultimate_slot_reset_progress";
     public static final String TAG_RESET_EARNED = "trnightmare:ultimate_slot_reset_earned";
 
+    private static final String TAG_SAVED_SLOTS = "tensura_prestige_fix:saved_slots";
+    private static final String TAG_PENDING_REINCARNATION = "tensura_prestige_fix:pending_reincarnation_restore";
+    private static final String TAG_DATA_VERSION = "tensura_prestige_fix:data_version";
+    private static final int CURRENT_DATA_VERSION = 2;
+
     private static final Map<UUID, PrestigeSlotSnapshot> ACTIVE_SNAPSHOTS = new ConcurrentHashMap<>();
+    private static final Map<UUID, Integer> PRE_RELEASE_RESET_COUNTERS = new ConcurrentHashMap<>();
+    private static final ThreadLocal<Boolean> IN_RELEASE_USING = ThreadLocal.withInitial(() -> Boolean.FALSE);
 
     private UltimateSlotPrestigeHandler() {
     }
 
     public static boolean isTrNightmareLoaded() {
         return ModList.get().isLoaded(TRNIGHTMARE_MOD_ID);
+    }
+
+    /**
+     * Marks the start of {@code ResetScrollItem.releaseUsing} so we can distinguish a Reset Scroll
+     * consumption from selecting a race in the Reincarnation GUI (which calls {@code resetEverything} directly).
+     */
+    public static void onBeginReleaseUsing(ServerPlayer player) {
+        if (player == null || player.level().isClientSide()) {
+            return;
+        }
+        IN_RELEASE_USING.set(Boolean.TRUE);
+        PRE_RELEASE_RESET_COUNTERS.put(player.getUUID(), getPlayerResetCounter(player));
+    }
+
+    /**
+     * Marks the end of {@code ResetScrollItem.releaseUsing}.
+     */
+    public static void onEndReleaseUsing(ServerPlayer player) {
+        IN_RELEASE_USING.set(Boolean.FALSE);
+        if (player != null) {
+            PRE_RELEASE_RESET_COUNTERS.remove(player.getUUID());
+        }
     }
 
     /**
@@ -76,6 +105,17 @@ public final class UltimateSlotPrestigeHandler {
             return;
         }
         InternalTrNightmareBridge.handlePrestigeConfirmed(player);
+    }
+
+    /**
+     * Enforces already-computed target slot state during post-reset sync events (such as {@code STPlayerEvents.PRESTIGE_LEVEL})
+     * without treating the sync event itself as a new Prestige.
+     */
+    public static void onPostResetSync(ServerPlayer player) {
+        if (player == null || player.level().isClientSide() || !isTrNightmareLoaded()) {
+            return;
+        }
+        InternalTrNightmareBridge.handlePostResetSync(player);
     }
 
     /**
@@ -112,17 +152,21 @@ public final class UltimateSlotPrestigeHandler {
     }
 
     /**
-     * Called when a player logs in to optionally recover missing Prestige Ultimate Slots that were
-     * wiped prior to installing this mod.
+     * Called when a player logs in to clean up any v1 inflated slots and optionally recover missing
+     * Prestige Ultimate Slots that were wiped prior to installing this mod.
      */
     public static void onPlayerLoggedIn(ServerPlayer player) {
+        reconcileAndRecoverSlots(player, false);
+    }
+
+    /**
+     * Reconciles and recovers a player's Prestige Ultimate Skill Slots based on their {@code resetCounter}.
+     */
+    public static void reconcileAndRecoverSlots(ServerPlayer player, boolean forceCleanup) {
         if (player == null || player.level().isClientSide() || !isTrNightmareLoaded()) {
             return;
         }
-        if (!PrestigeFixConfig.AUTO_RECOVER_PRESTIGE_SLOTS_ON_LOGIN.get()) {
-            return;
-        }
-        InternalTrNightmareBridge.recoverMissingPrestigeSlotsIfNeeded(player);
+        InternalTrNightmareBridge.onPlayerLogin(player, forceCleanup);
     }
 
     public static int getPlayerResetCounter(Player player) {
@@ -145,9 +189,11 @@ public final class UltimateSlotPrestigeHandler {
         public final int resetEarnedBefore;
         public final boolean selfNamingBefore;
         public final boolean awakeningBefore;
+        public final boolean triggeredFromScrollRelease;
 
         public boolean prestigeConfirmed;
         public boolean scalingApplied;
+        public boolean preserveWithoutScaling;
         public int targetSlotsAfter;
         public int targetResetProgress;
         public int targetResetEarned;
@@ -163,7 +209,8 @@ public final class UltimateSlotPrestigeHandler {
                 int resetProgressBefore,
                 int resetEarnedBefore,
                 boolean selfNamingBefore,
-                boolean awakeningBefore
+                boolean awakeningBefore,
+                boolean triggeredFromScrollRelease
         ) {
             this.playerUuid = playerUuid;
             this.capturedGameTime = capturedGameTime;
@@ -173,8 +220,10 @@ public final class UltimateSlotPrestigeHandler {
             this.resetEarnedBefore = resetEarnedBefore;
             this.selfNamingBefore = selfNamingBefore;
             this.awakeningBefore = awakeningBefore;
+            this.triggeredFromScrollRelease = triggeredFromScrollRelease;
             this.prestigeConfirmed = false;
             this.scalingApplied = false;
+            this.preserveWithoutScaling = !triggeredFromScrollRelease;
             this.targetSlotsAfter = slotsBefore;
             this.targetResetProgress = resetProgressBefore;
             this.targetResetEarned = resetEarnedBefore;
@@ -202,13 +251,26 @@ public final class UltimateSlotPrestigeHandler {
                 return;
             }
 
+            boolean fromScrollRelease = Boolean.TRUE.equals(IN_RELEASE_USING.get());
             int currentSlots = UltimateSlotHelper.getSlotCount(player);
-            int resetCounter = getPlayerResetCounter(player);
+            Integer preReleaseCounter = PRE_RELEASE_RESET_COUNTERS.get(uuid);
+            int resetCounter = preReleaseCounter != null ? preReleaseCounter : getPlayerResetCounter(player);
+
             CompoundTag tag = player.getPersistentData();
             int resetProgress = Math.max(0, tag.getInt(TAG_RESET_PROGRESS));
             int resetEarned = Math.max(0, tag.getInt(TAG_RESET_EARNED));
             boolean selfNaming = tag.getBoolean(TAG_SELF_NAMING);
             boolean awakening = tag.getBoolean(TAG_AWAKENING);
+
+            // If the player previously Prestiged (or reset) and is now clicking a race in the Reincarnation GUI
+            // (which calls ResetScrollItem.resetEverything outside releaseUsing), ensure we don't lose saved slots.
+            if (!fromScrollRelease && tag.getBoolean(TAG_PENDING_REINCARNATION)) {
+                int savedSlots = tag.getInt(TAG_SAVED_SLOTS);
+                if (savedSlots > currentSlots) {
+                    currentSlots = savedSlots;
+                }
+                tag.remove(TAG_PENDING_REINCARNATION);
+            }
 
             PrestigeSlotSnapshot snapshot = new PrestigeSlotSnapshot(
                     uuid,
@@ -218,7 +280,8 @@ public final class UltimateSlotPrestigeHandler {
                     resetProgress,
                     resetEarned,
                     selfNaming,
-                    awakening
+                    awakening,
+                    fromScrollRelease
             );
             if (explicitPrestigeIntent) {
                 snapshot.prestigeConfirmed = true;
@@ -226,8 +289,8 @@ public final class UltimateSlotPrestigeHandler {
             ACTIVE_SNAPSHOTS.put(uuid, snapshot);
 
             TensuraPrestigeFix.LOGGER.debug(
-                    "[TensuraPrestigeFix] Captured Ultimate Slot snapshot for {}: slots={}, resetCounter={}, resetEarned={}, resetProgress={}",
-                    player.getGameProfile().getName(), currentSlots, resetCounter, resetEarned, resetProgress
+                    "[TensuraPrestigeFix] Captured Ultimate Slot snapshot for {}: slots={}, resetCounter={}, resetEarned={}, resetProgress={}, fromScroll={}",
+                    player.getGameProfile().getName(), currentSlots, resetCounter, resetEarned, resetProgress, fromScrollRelease
             );
         }
 
@@ -240,6 +303,13 @@ public final class UltimateSlotPrestigeHandler {
             snapshot.prestigeConfirmed = true;
             applyPostPrestigeCalculationsIfNeeded(player, snapshot);
             enforceTargetState(player, snapshot);
+        }
+
+        private static void handlePostResetSync(ServerPlayer player) {
+            PrestigeSlotSnapshot snapshot = ACTIVE_SNAPSHOTS.get(player.getUUID());
+            if (snapshot != null) {
+                enforceTargetState(player, snapshot);
+            }
         }
 
         private static void handleAfterResetEverything(ServerPlayer player) {
@@ -255,7 +325,8 @@ public final class UltimateSlotPrestigeHandler {
                     enforceTargetState(player, snapshot);
                     // Also ensure FTB Quests are reset if Prestige occurred via ResetScrollItem
                     FtbQuestsPrestigeResetHandler.onPlayerPrestige(player);
-                } else if (PrestigeFixConfig.PRESERVE_ULTIMATE_SLOTS_ON_ANY_FULL_RESET.get()) {
+                } else {
+                    applyNonPrestigeResetResolution(player, snapshot);
                     enforceTargetState(player, snapshot);
                 }
             }
@@ -276,13 +347,45 @@ public final class UltimateSlotPrestigeHandler {
                     applyPostPrestigeCalculationsIfNeeded(serverPlayer, snapshot);
                 }
                 enforceTargetState(player, snapshot);
-            } else if (PrestigeFixConfig.PRESERVE_ULTIMATE_SLOTS_ON_ANY_FULL_RESET.get()) {
-                enforceTargetState(player, snapshot);
             } else {
-                // Even on a non-prestige reset, preserve reset_progress and reset_earned so prior Prestige progress is not lost!
+                applyNonPrestigeResetResolution(player, snapshot);
+                enforceTargetState(player, snapshot);
+            }
+        }
+
+        /**
+         * Resolves target slot state when {@code resetEverything} or {@code onCharacterReset} runs
+         * WITHOUT a Prestige occurring:
+         * <ul>
+         *   <li>If triggered outside {@code ResetScrollItem.releaseUsing} (e.g., selecting a race in the
+         *       Reincarnation GUI several seconds after Prestiging or resetting), preserve all current slots
+         *       and milestone tags unchanged.</li>
+         *   <li>If triggered by consuming a non-Prestige Character Reset Scroll ({@code triggeredFromScrollRelease == true}),
+         *       either preserve all slots (if {@code preserveUltimateSlotsOnAnyFullReset} is enabled) or reset
+         *       run-specific milestones (Self-Naming / Awakening) back to {@code DefaultUltimateSlots + resetEarnedBefore}
+         *       so permanent Prestige-earned slots are never wiped.</li>
+         * </ul>
+         */
+        private static void applyNonPrestigeResetResolution(Player player, PrestigeSlotSnapshot snapshot) {
+            if (!snapshot.triggeredFromScrollRelease || PrestigeFixConfig.PRESERVE_ULTIMATE_SLOTS_ON_ANY_FULL_RESET.get()) {
+                snapshot.preserveWithoutScaling = true;
+                snapshot.targetSlotsAfter = snapshot.slotsBefore;
+                snapshot.targetResetProgress = snapshot.resetProgressBefore;
+                snapshot.targetResetEarned = snapshot.resetEarnedBefore;
+                snapshot.targetSelfNaming = snapshot.selfNamingBefore;
+                snapshot.targetAwakening = snapshot.awakeningBefore;
+            } else {
+                snapshot.preserveWithoutScaling = true;
+                int defaultSlots = Math.max(0, UltimateSlotConfig.INSTANCE.DefaultUltimateSlots.get());
+                snapshot.targetResetProgress = snapshot.resetProgressBefore;
+                snapshot.targetResetEarned = snapshot.resetEarnedBefore;
+                snapshot.targetSelfNaming = false;
+                snapshot.targetAwakening = false;
+                snapshot.targetSlotsAfter = Math.max(0, defaultSlots + snapshot.resetEarnedBefore);
+
                 CompoundTag tag = player.getPersistentData();
-                tag.putInt(TAG_RESET_PROGRESS, snapshot.targetResetProgress);
-                tag.putInt(TAG_RESET_EARNED, snapshot.targetResetEarned);
+                tag.putInt(TAG_SAVED_SLOTS, snapshot.targetSlotsAfter);
+                tag.putBoolean(TAG_PENDING_REINCARNATION, true);
             }
         }
 
@@ -339,6 +442,11 @@ public final class UltimateSlotPrestigeHandler {
             snapshot.targetResetEarned = resetEarned;
             snapshot.targetSlotsAfter = Math.max(0, baseSlots + totalGained);
 
+            CompoundTag tag = player.getPersistentData();
+            tag.putInt(TAG_SAVED_SLOTS, snapshot.targetSlotsAfter);
+            tag.putBoolean(TAG_PENDING_REINCARNATION, true);
+            tag.putInt(TAG_DATA_VERSION, CURRENT_DATA_VERSION);
+
             enforceTargetState(player, snapshot);
 
             TensuraPrestigeFix.LOGGER.info(
@@ -354,8 +462,10 @@ public final class UltimateSlotPrestigeHandler {
             if (PrestigeFixConfig.NOTIFY_PLAYER_ON_SLOT_RESTORE.get()) {
                 if (totalGained > 0) {
                     player.sendSystemMessage(
-                            Component.translatable("message.trnightmare.ultimate_slot_gained.reset", totalGained, snapshot.targetSlotsAfter)
-                                    .withStyle(ChatFormatting.AQUA)
+                            Component.literal("[Prestige] ")
+                                    .withStyle(ChatFormatting.GOLD, ChatFormatting.BOLD)
+                                    .append(Component.literal("You gained +" + totalGained + " Ultimate Skill Slot(s)! Total Ultimate Skill Slots: " + snapshot.targetSlotsAfter + ".")
+                                            .withStyle(ChatFormatting.AQUA))
                     );
                 } else {
                     player.sendSystemMessage(
@@ -372,6 +482,7 @@ public final class UltimateSlotPrestigeHandler {
             CompoundTag tag = player.getPersistentData();
             tag.putInt(TAG_RESET_PROGRESS, snapshot.targetResetProgress);
             tag.putInt(TAG_RESET_EARNED, snapshot.targetResetEarned);
+            tag.putInt(TAG_SAVED_SLOTS, snapshot.targetSlotsAfter);
             if (snapshot.targetSelfNaming) {
                 tag.putBoolean(TAG_SELF_NAMING, true);
             } else {
@@ -397,7 +508,7 @@ public final class UltimateSlotPrestigeHandler {
                 Map.Entry<UUID, PrestigeSlotSnapshot> entry = iterator.next();
                 PrestigeSlotSnapshot snapshot = entry.getValue();
                 ServerPlayer player = server.getPlayerList().getPlayer(snapshot.playerUuid);
-                if (player != null && (snapshot.prestigeConfirmed || PrestigeFixConfig.PRESERVE_ULTIMATE_SLOTS_ON_ANY_FULL_RESET.get())) {
+                if (player != null && (snapshot.prestigeConfirmed || snapshot.preserveWithoutScaling)) {
                     enforceTargetState(player, snapshot);
                 }
                 snapshot.guardTicksRemaining--;
@@ -407,39 +518,75 @@ public final class UltimateSlotPrestigeHandler {
             }
         }
 
-        private static void recoverMissingPrestigeSlotsIfNeeded(ServerPlayer player) {
-            int resetCounter = getPlayerResetCounter(player);
-            if (resetCounter <= 0) {
-                return;
-            }
-            if (!UltimateSlotConfig.INSTANCE.UltimateSlotResetGain.get()) {
-                return;
-            }
-
-            int earn = Math.max(0, UltimateSlotConfig.INSTANCE.UltimateSlotResetEarn.get());
+        private static void onPlayerLogin(ServerPlayer player, boolean forceCleanup) {
+            CompoundTag tag = player.getPersistentData();
+            int dataVersion = tag.getInt(TAG_DATA_VERSION);
+            int resetCounter = Math.max(0, getPlayerResetCounter(player));
+            int defaultSlots = Math.max(0, UltimateSlotConfig.INSTANCE.DefaultUltimateSlots.get());
+            int earn = UltimateSlotConfig.INSTANCE.UltimateSlotResetGain.get()
+                    ? Math.max(0, UltimateSlotConfig.INSTANCE.UltimateSlotResetEarn.get())
+                    : 0;
             int rate = Math.max(1, UltimateSlotConfig.INSTANCE.UltimateSlotResetEarnRate.get());
             int configuredOverrideMax = PrestigeFixConfig.OVERRIDE_MAX_ULTIMATE_SLOTS_FROM_PRESTIGE.get();
             int maxEarned = configuredOverrideMax >= 0
                     ? configuredOverrideMax
                     : Math.max(0, UltimateSlotConfig.INSTANCE.UltimateSlotResetMaxEarned.get());
 
-            if (earn <= 0) {
-                return;
-            }
-
-            int expectedCycles = resetCounter / rate;
-            int expectedProgress = resetCounter % rate;
+            int expectedCycles = earn > 0 ? (resetCounter / rate) : 0;
+            int expectedProgress = earn > 0 ? (resetCounter % rate) : 0;
             int expectedEarnedFromResets = expectedCycles * earn;
             if (maxEarned > 0) {
                 expectedEarnedFromResets = Math.min(expectedEarnedFromResets, maxEarned);
             }
+
+            // Cleanup for players whose reset_earned was inflated by STPlayerEvents.PRESTIGE_LEVEL (level=0) in v1
+            if (forceCleanup || dataVersion < CURRENT_DATA_VERSION) {
+                int recordedEarned = Math.max(0, tag.getInt(TAG_RESET_EARNED));
+                if (recordedEarned > expectedEarnedFromResets) {
+                    int excessEarned = recordedEarned - expectedEarnedFromResets;
+                    int currentSlots = UltimateSlotHelper.getSlotCount(player);
+                    int correctedSlots = Math.max(defaultSlots + expectedEarnedFromResets, currentSlots - excessEarned);
+
+                    tag.putInt(TAG_RESET_EARNED, expectedEarnedFromResets);
+                    tag.putInt(TAG_RESET_PROGRESS, expectedProgress);
+                    tag.putInt(TAG_SAVED_SLOTS, correctedSlots);
+                    tag.remove(TAG_PENDING_REINCARNATION);
+
+                    SoulData soulData = SoulCapabilityProvider.resolve(player);
+                    soulData.setUltimateSlots(correctedSlots);
+                    SoulCapabilityProvider.persist(player, soulData);
+
+                    TensuraPrestigeFix.LOGGER.info(
+                            "[TensuraPrestigeFix] Cleaned up inflated Ultimate Slots for {} (resetCounter={}): {} -> {} slots (resetEarned {} -> {}).",
+                            player.getGameProfile().getName(), resetCounter, currentSlots, correctedSlots, recordedEarned, expectedEarnedFromResets
+                    );
+                }
+                tag.putInt(TAG_DATA_VERSION, CURRENT_DATA_VERSION);
+            }
+
+            if (forceCleanup || PrestigeFixConfig.AUTO_RECOVER_PRESTIGE_SLOTS_ON_LOGIN.get()) {
+                recoverMissingPrestigeSlotsIfNeeded(player, resetCounter, defaultSlots, earn, expectedProgress, expectedEarnedFromResets);
+            }
+        }
+
+        private static void recoverMissingPrestigeSlotsIfNeeded(
+                ServerPlayer player,
+                int resetCounter,
+                int defaultSlots,
+                int earn,
+                int expectedProgress,
+                int expectedEarnedFromResets
+        ) {
+            if (resetCounter <= 0 || earn <= 0) {
+                return;
+            }
+
             int extraPerPrestige = Math.max(0, PrestigeFixConfig.EXTRA_ULTIMATE_SLOTS_PER_PRESTIGE.get());
             int expectedExtraBonus = resetCounter * extraPerPrestige;
 
             CompoundTag tag = player.getPersistentData();
             int recordedEarned = Math.max(0, tag.getInt(TAG_RESET_EARNED));
             int currentSlots = UltimateSlotHelper.getSlotCount(player);
-            int defaultSlots = Math.max(0, UltimateSlotConfig.INSTANCE.DefaultUltimateSlots.get());
 
             // Minimum slots a player with this many Prestiges should have
             int minimumExpectedSlots = Math.max(0, defaultSlots + expectedEarnedFromResets + expectedExtraBonus);
@@ -450,6 +597,7 @@ public final class UltimateSlotPrestigeHandler {
 
                 tag.putInt(TAG_RESET_EARNED, Math.max(recordedEarned, expectedEarnedFromResets));
                 tag.putInt(TAG_RESET_PROGRESS, expectedProgress);
+                tag.putInt(TAG_SAVED_SLOTS, newSlots);
                 SoulData soulData = SoulCapabilityProvider.resolve(player);
                 soulData.setUltimateSlots(newSlots);
                 SoulCapabilityProvider.persist(player, soulData);
